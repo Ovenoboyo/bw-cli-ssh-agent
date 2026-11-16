@@ -11,42 +11,59 @@ import (
 )
 
 // readSecretInput reads from the controlling terminal (hiding input if hide is true)
-// or falls back to the desktop askpass prompt if stdin is not a TTY.
+// or falls back to the desktop askpass prompt if no terminal is attached.
 func readSecretInput(title, prompt string, hide bool) ([]byte, error) {
-	fd := int(os.Stdin.Fd())
-	if term.IsTerminal(fd) {
-		fmt.Fprint(os.Stderr, prompt)
-		if hide {
-			b, err := term.ReadPassword(fd)
-			fmt.Fprintln(os.Stderr)
-			if err != nil {
-				return nil, fmt.Errorf("failed to read secret from terminal: %w", err)
-			}
-			return bytes.TrimSpace(b), nil
-		}
-
-		var buf bytes.Buffer
-		var ch [1]byte
-		for {
-			n, err := os.Stdin.Read(ch[:])
-			if n > 0 {
-				if ch[0] == '\n' || ch[0] == '\r' {
-					break
-				}
-				buf.WriteByte(ch[0])
-			}
-			if err != nil {
-				break
-			}
-		}
-		return bytes.TrimSpace(buf.Bytes()), nil
+	if b, err := readFromTTY(prompt, hide); err == nil {
+		return b, nil
 	}
-
 	return promptSecret(title, strings.TrimSpace(prompt), hide)
 }
 
-// promptSecret asks the user for a secret (password or email) via an available desktop/system askpass dialog.
+// readFromTTY opens /dev/tty directly so it works even if os.Stdin is redirected,
+// and reads a line (with echo disabled via term.ReadPassword when hide is true).
+func readFromTTY(prompt string, hide bool) ([]byte, error) {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer tty.Close()
+
+	fd := int(tty.Fd())
+	if !term.IsTerminal(fd) {
+		return nil, fmt.Errorf("/dev/tty is not a terminal")
+	}
+
+	fmt.Fprint(tty, prompt)
+	if hide {
+		b, err := term.ReadPassword(fd)
+		fmt.Fprintln(tty)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read secret from tty: %w", err)
+		}
+		return bytes.TrimSpace(b), nil
+	}
+
+	var buf bytes.Buffer
+	var ch [1]byte
+	for {
+		n, err := tty.Read(ch[:])
+		if n > 0 {
+			if ch[0] == '\n' || ch[0] == '\r' {
+				break
+			}
+			buf.WriteByte(ch[0])
+		}
+		if err != nil {
+			break
+		}
+	}
+	return bytes.TrimSpace(buf.Bytes()), nil
+}
+
+// promptSecret asks the user for a secret via an available desktop/system askpass dialog,
+// falling back to prompting directly on /dev/tty if no GUI/system helper is installed.
 func promptSecret(title, text string, hide bool) ([]byte, error) {
+	// 1. Try zenity (GTK / GNOME / Hyprland)
 	if path, err := exec.LookPath("zenity"); err == nil {
 		args := []string{"--entry", "--title=" + title, "--text=" + text}
 		if hide {
@@ -59,6 +76,7 @@ func promptSecret(title, text string, hide bool) ([]byte, error) {
 		return bytes.TrimRight(out, "\r\n"), nil
 	}
 
+	// 2. Try kdialog (KDE / Qt)
 	if path, err := exec.LookPath("kdialog"); err == nil {
 		flag := "--inputbox"
 		if hide {
@@ -71,6 +89,7 @@ func promptSecret(title, text string, hide bool) ([]byte, error) {
 		return bytes.TrimRight(out, "\r\n"), nil
 	}
 
+	// 3. Try yad
 	if path, err := exec.LookPath("yad"); err == nil {
 		args := []string{"--entry", "--title=" + title, "--text=" + text}
 		if hide {
@@ -83,6 +102,7 @@ func promptSecret(title, text string, hide bool) ([]byte, error) {
 		return bytes.TrimRight(out, "\r\n"), nil
 	}
 
+	// 4. Try systemd-ask-password
 	if path, err := exec.LookPath("systemd-ask-password"); err == nil {
 		out, err := exec.Command(path, "--no-tty", fmt.Sprintf("%s: %s", title, text)).Output()
 		if err != nil {
@@ -91,7 +111,13 @@ func promptSecret(title, text string, hide bool) ([]byte, error) {
 		return bytes.TrimRight(out, "\r\n"), nil
 	}
 
-	return nil, fmt.Errorf("no interactive prompt utility found (install zenity, kdialog, yad, or systemd)")
+	// 5. Final fallback: prompt directly on the controlling terminal (/dev/tty)
+	promptLine := fmt.Sprintf("\n[%s] %s ", title, text)
+	if b, err := readFromTTY(promptLine, hide); err == nil {
+		return b, nil
+	}
+
+	return nil, fmt.Errorf("no interactive prompt utility found and no controlling terminal (/dev/tty) available; install zenity, kdialog, or yad")
 }
 
 // isSessionInvalid checks common bw CLI stderr messages indicating a locked or expired vault.
