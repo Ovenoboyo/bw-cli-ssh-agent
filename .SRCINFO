@@ -1,0 +1,20 @@
+pkgbase = bw-ssh-agent
+	pkgdesc = Hardened SSH agent backed by Bitwarden CLI with Polkit and Pinentry support
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/Ovenoboyo/bw-cli-ssh-agent
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = go
+	depends = bitwarden-cli
+	depends = polkit
+	optdepends = pinentry: native GUI/curses password dialogs
+	optdepends = gnome-keyring: libsecret session persistence
+	optdepends = kwallet: KDE Wallet session persistence
+	optdepends = zenity: GTK fallback password dialog
+	optdepends = kdialog: KDE fallback password dialog
+	source = bw-ssh-agent-0.1.0.tar.gz::https://github.com/Ovenoboyo/bw-cli-ssh-agent/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = 6004018cd69deeefc677d5696b42a15209e825338fa3283712cf4543dc3a1c3b
+
+pkgname = bw-ssh-agent

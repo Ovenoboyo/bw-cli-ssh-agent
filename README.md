@@ -10,12 +10,12 @@ Use your Bitwarden vault as an SSH agent on Linux. Authenticate SSH connections 
 
 - **No Private Keys on Disk:** Keeps your SSH private keys safely inside Bitwarden and only fetches them in memory for the split second needed to sign an SSH login.
 - **Fast SSH Connections:** Caches your public keys locally so `ssh` and `ssh-add -L` respond immediately without waiting for Bitwarden on every connection.
-- **Desktop Authentication Prompts:** Asks for approval via your desktop authentication dialog (Polkit—supporting passwords, fingerprint readers, and security keys) before signing SSH requests.
+- **Desktop Authentication Prompts:** Asks for approval via your desktop authentication dialog (Polkit—supporting passwords, fingerprint readers, and security keys) before signing SSH requests, with an optional approval cache timer (`--polkit-cache-ttl`) so you aren't prompted on rapid back-to-back commands.
 - **Native Password Dialogs:** Prompts for your Bitwarden master password using native desktop dialogs (`pinentry`, `zenity`, `kdialog`, `yad`) or directly in your terminal when running headless.
 - **Automatic Session Persistence:** Remembers your unlocked Bitwarden session in your desktop keyring (GNOME Keyring, KWallet, KeePassXC) or Linux user session keyring so you aren't prompted on every single SSH command.
 - **Optional Master Password Caching:** Disabled by default for maximum security, with a one-flag opt-in (`--store-master-password`) if you prefer unlocking solely with your system authentication.
-- **Agent Forwarding Protection:** Blocks forwarded SSH agent sessions from signing requests by default so a compromised remote server cannot misuse your local keys.
-- **Built-In Health Check (`doctor`):** Diagnoses missing dependencies, keyring availability, vault status, and shell environment setup with a single command.
+- **Agent Forwarding Protection:** Blocks forwarded SSH agent sessions (`ssh -A`) from signing requests by default so a compromised remote server cannot misuse your local keys.
+- **Built-In Health Check (`doctor`):** Diagnoses missing dependencies, keyring availability, vault status, active settings, and shell environment setup with a single command.
 
 ---
 
@@ -109,10 +109,11 @@ systemctl --user enable --now bw-ssh-agent.service
 
 | Command / Flag | Description |
 | :--- | :--- |
-| `bw-ssh-agent doctor` | Check dependencies, prompt backend, keyring availability, vault status, and agent socket. |
+| `bw-ssh-agent doctor` | Check dependencies, prompt backend, keyring availability, vault status, config, and agent socket. |
 | `bw-ssh-agent --login-apikey` | Prompt for your Bitwarden Client ID and Client Secret to log in `bw` once. |
 | `bw-ssh-agent --store-master-password` | Save your Bitwarden master password in your system keyring and enable automatic unlock. |
 | `bw-ssh-agent --clear-master-password` | Delete any saved master password from your keyring and disable automatic unlock. |
+| `bw-ssh-agent --polkit-cache-ttl <sec>` | Cache Polkit signing approvals for `<sec>` seconds (`0` to prompt every time, default `0`). |
 | `bw-ssh-agent --polkit-on-unlock` | Require a Polkit authentication prompt even when entering your master password manually. |
 | `bw-ssh-agent --no-polkit-on-unlock` | Skip the extra Polkit prompt when you are already typing your master password (default). |
 | `bw-ssh-agent --allow-forwarding` | Allow SSH signing requests over forwarded agent sessions (`ssh -A`). |
@@ -134,11 +135,17 @@ systemctl --user enable --now bw-ssh-agent.service
 {
   "store_master_password": false,
   "require_polkit_on_unlock": false,
-  "allow_agent_forwarding": false
+  "allow_agent_forwarding": false,
+  "polkit_cache_ttl_seconds": 0
 }
 ```
 
-Restart the running daemon after updating configuration settings so changes take effect.
+You can update settings via CLI flags (for example, `bw-ssh-agent --polkit-cache-ttl 300 --show-config`) or by editing `config.json` directly. Restart the running daemon afterward so updated settings take effect:
+
+```bash
+pkill -TERM -x bw-ssh-agent
+# Or: systemctl --user restart bw-ssh-agent.service
+```
 
 ---
 
@@ -148,7 +155,7 @@ Restart the running daemon after updating configuration settings so changes take
   ```bash
   ssh-add -L
   ```
-- **Lock the agent immediately (clears cached session, master password, and keys):**
+- **Lock the agent immediately (clears cached session, master password, Polkit approval cache, and keys):**
   ```bash
   ssh-add -x
   ```
