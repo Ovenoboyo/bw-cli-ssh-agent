@@ -27,7 +27,33 @@ Use your Bitwarden vault as an SSH agent on Linux. Authenticate SSH connections 
 
 ---
 
-## Building from Source
+## Installation
+
+### Arch Linux (AUR)
+
+Install `bw-ssh-agent-git` using your preferred AUR helper (`paru` or `yay`):
+
+```bash
+paru -S bw-ssh-agent-git
+# or
+yay -S bw-ssh-agent-git
+```
+
+The AUR package automatically installs:
+- `/usr/bin/bw-ssh-agent`
+- `/usr/lib/systemd/user/bw-ssh-agent.service` (systemd user unit)
+- `/usr/lib/environment.d/90-bw-ssh-agent.conf` (exports `SSH_AUTH_SOCK=${XDG_RUNTIME_DIR}/bw-ssh-agent.sock` to your user session)
+
+Enable and start the user service after installing:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now bw-ssh-agent.service
+```
+
+*(Log out and back in for `environment.d` to apply `SSH_AUTH_SOCK` globally, or export it immediately in your current shell—see [Quick Start](#2-start-the-agent--configure-your-shell).)*
+
+### Building from Source
 
 Ensure you have **Go 1.23 or newer** installed, then clone the repository and compile the binary:
 
@@ -57,6 +83,8 @@ bw-ssh-agent --login-apikey
 
 ### 2. Start the Agent & Configure Your Shell
 
+If you installed via the AUR package and enabled `bw-ssh-agent.service`, `SSH_AUTH_SOCK` is exported automatically via `/usr/lib/environment.d/90-bw-ssh-agent.conf`. If another agent (such as `gnome-keyring` or `gcr-ssh-agent`) overrides `SSH_AUTH_SOCK`, or if you built from source, configure your shell explicitly:
+
 #### Fish (`~/.config/fish/config.fish`)
 ```fish
 if test -n "$XDG_RUNTIME_DIR"
@@ -81,10 +109,13 @@ if [ -n "$XDG_RUNTIME_DIR" ]; then
 fi
 ```
 
-#### Optional: Systemd User Service (`~/.config/systemd/user/bw-ssh-agent.service`)
+#### Manual Systemd User Service (Source Installs Only)
+If you built from source instead of using the AUR package, create `~/.config/systemd/user/bw-ssh-agent.service`:
+
 ```ini
 [Unit]
 Description=Bitwarden CLI SSH Agent
+Documentation=[https://github.com/Ovenoboyo/bw-cli-ssh-agent](https://github.com/Ovenoboyo/bw-cli-ssh-agent)
 After=graphical-session.target
 
 [Service]
@@ -143,8 +174,8 @@ systemctl --user enable --now bw-ssh-agent.service
 You can update settings via CLI flags (for example, `bw-ssh-agent --polkit-cache-ttl 300 --show-config`) or by editing `config.json` directly. Restart the running daemon afterward so updated settings take effect:
 
 ```bash
-pkill -TERM -x bw-ssh-agent
-# Or: systemctl --user restart bw-ssh-agent.service
+systemctl --user restart bw-ssh-agent.service
+# Or if started manually: pkill -TERM -x bw-ssh-agent
 ```
 
 ---
