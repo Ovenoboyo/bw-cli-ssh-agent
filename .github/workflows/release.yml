@@ -1,0 +1,58 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build Linux Binaries & Publish Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests & vet
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Build release binaries
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            echo "Building linux/${arch}..."
+            GOARCH="${arch}" go build \
+              -trimpath \
+              -ldflags="-s -w" \
+              -o "dist/bw-ssh-agent-linux-${arch}" \
+              ./cmd
+            tar -czf "dist/bw-ssh-agent-${{ github.ref_name }}-linux-${arch}.tar.gz" \
+              -C dist "bw-ssh-agent-linux-${arch}"
+          done
+          cd dist && sha256sum *.tar.gz bw-ssh-agent-linux-* > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/bw-ssh-agent-linux-amd64
+            dist/bw-ssh-agent-linux-arm64
+            dist/bw-ssh-agent-${{ github.ref_name }}-linux-amd64.tar.gz
+            dist/bw-ssh-agent-${{ github.ref_name }}-linux-arm64.tar.gz
+            dist/SHA256SUMS.txt
