@@ -31,10 +31,6 @@ func Run(ctx context.Context, cfg Config, bwAgent *agent.BitwardenAgent) error {
 		logger = slog.Default()
 	}
 
-	if err := bwAgent.RefreshCache(); err != nil {
-		return fmt.Errorf("initial cache load failed: %w", err)
-	}
-
 	// Remove stale socket if left behind from an ungraceful exit
 	_ = os.Remove(cfg.SocketPath)
 
@@ -48,11 +44,9 @@ func Run(ctx context.Context, cfg Config, bwAgent *agent.BitwardenAgent) error {
 		return fmt.Errorf("failed to chmod socket %s: %w", cfg.SocketPath, err)
 	}
 
-	// Tie OS termination signals into a cancellable context
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Handle SIGHUP cache reloads in the background
 	sighup := make(chan os.Signal, 1)
 	signal.Notify(sighup, syscall.SIGHUP)
 	defer signal.Stop(sighup)
@@ -71,7 +65,6 @@ func Run(ctx context.Context, cfg Config, bwAgent *agent.BitwardenAgent) error {
 		}
 	}()
 
-	// Close listener when context is canceled so Accept() unblocks immediately
 	go func() {
 		<-ctx.Done()
 		logger.Info("shutting down server", "socket", cfg.SocketPath)

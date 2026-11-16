@@ -30,27 +30,57 @@ type cachedKey struct {
 	AgentID *sshagent.Key
 }
 
-// BitwardenAgent implements sshagent.ExtendedAgent backed by Bitwarden CLI and kernel keyring.
+// BitwardenAgent implements sshagent.ExtendedAgent backed by Bitwarden CLI.
 type BitwardenAgent struct {
-	keyringDesc string
-	logger      *slog.Logger
+	store  *sessionStore
+	logger *slog.Logger
+
 	mu          sync.RWMutex
+	initialized bool
 	cache       []cachedKey
 }
 
-// New creates a new BitwardenAgent using the given kernel keyring description and logger.
-// If keyringDesc is empty, DefaultKeyringDesc is used. If logger is nil, slog.Default() is used.
+// New creates a new BitwardenAgent with keyring + in-memory fallback session management.
 func New(keyringDesc string, logger *slog.Logger) *BitwardenAgent {
-	if keyringDesc == "" {
-		keyringDesc = DefaultKeyringDesc
-	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &BitwardenAgent{
-		keyringDesc: keyringDesc,
-		logger:      logger,
+		store:  newSessionStore(keyringDesc, logger),
+		logger: logger,
 	}
+}
+
+// runBWWithRetry executes a bw subcommand with BW_SESSION, prompting to unlock if missing or expired.
+func (b *BitwardenAgent) runBWWithRetry(args ...string) ([]byte, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		session, err := b.store.EnsureSession()
+		if err != nil {
+			return nil, err
+		}
+
+		cmd := exec.Command("bw", args...)
+		cmd.Env = append(os.Environ(), "BW_SESSION="+string(session))
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		err = cmd.Run()
+		zeroBytes(session)
+
+		if err == nil {
+			return stdout.Bytes(), nil
+		}
+
+		errText := stderr.String()
+		if attempt == 0 && isSessionInvalid(errText) {
+			b.logger.Warn("Bitwarden session expired or locked; clearing and re-prompting")
+			b.store.Clear()
+			continue
+		}
+		return nil, fmt.Errorf("bw %v failed: %w (%s)", args, err, errText)
+	}
+	return nil, fmt.Errorf("bw %v failed after unlock retry", args)
 }
 
 // RefreshCache fetches only public key metadata from Bitwarden and stores it in RAM.
@@ -58,19 +88,10 @@ func (b *BitwardenAgent) RefreshCache() error {
 	start := time.Now()
 	b.logger.Info("refreshing public key cache")
 
-	session, err := readSessionFromKeyring(b.keyringDesc)
+	out, err := b.runBWWithRetry("list", "items")
 	if err != nil {
-		b.logger.Error("failed to read session from keyring", "err", err)
+		b.logger.Error("failed to list items from Bitwarden", "err", err)
 		return err
-	}
-	defer zeroBytes(session)
-
-	cmd := exec.Command("bw", "list", "items")
-	cmd.Env = append(os.Environ(), "BW_SESSION="+string(session))
-	out, err := cmd.Output()
-	if err != nil {
-		b.logger.Error("bw list items failed", "err", err)
-		return fmt.Errorf("bw list items failed: %w", err)
 	}
 
 	var all []bwItem
@@ -103,14 +124,25 @@ func (b *BitwardenAgent) RefreshCache() error {
 
 	b.mu.Lock()
 	b.cache = updated
+	b.initialized = true
 	b.mu.Unlock()
 
 	b.logger.Info("public key cache updated", "count", len(updated), "duration", time.Since(start))
 	return nil
 }
 
-// List serves cached public keys without spawning bw or triggering Polkit.
+// List ensures the vault has been unlocked at least once to populate public keys, then serves from cache.
 func (b *BitwardenAgent) List() ([]*sshagent.Key, error) {
+	b.mu.RLock()
+	init := b.initialized
+	b.mu.RUnlock()
+
+	if !init {
+		if err := b.RefreshCache(); err != nil {
+			return nil, err
+		}
+	}
+
 	b.mu.RLock()
 	keys := make([]*sshagent.Key, len(b.cache))
 	for i, k := range b.cache {
@@ -128,6 +160,16 @@ func (b *BitwardenAgent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, e
 
 func (b *BitwardenAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags sshagent.SignatureFlags) (*ssh.Signature, error) {
 	start := time.Now()
+
+	b.mu.RLock()
+	init := b.initialized
+	b.mu.RUnlock()
+	if !init {
+		if err := b.RefreshCache(); err != nil {
+			return nil, err
+		}
+	}
+
 	targetBlob := key.Marshal()
 
 	b.mu.RLock()
@@ -154,19 +196,10 @@ func (b *BitwardenAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ssh
 	}
 	b.logger.Info("polkit authorization approved", "key_name", matchedName)
 
-	session, err := readSessionFromKeyring(b.keyringDesc)
-	if err != nil {
-		b.logger.Error("failed to read session from keyring during sign", "err", err)
-		return nil, err
-	}
-	defer zeroBytes(session)
-
-	getCmd := exec.Command("bw", "get", "item", matchedID)
-	getCmd.Env = append(os.Environ(), "BW_SESSION="+string(session))
-	rawItem, err := getCmd.Output()
+	rawItem, err := b.runBWWithRetry("get", "item", matchedID)
 	if err != nil {
 		b.logger.Error("bw get item failed", "item_id", matchedID, "err", err)
-		return nil, fmt.Errorf("bw get item failed: %w", err)
+		return nil, err
 	}
 	defer zeroBytes(rawItem)
 
@@ -224,11 +257,12 @@ func (b *BitwardenAgent) RemoveAll() error {
 	return fmt.Errorf("read-only agent")
 }
 func (b *BitwardenAgent) Lock(passphrase []byte) error {
-	b.logger.Warn("agent call: Lock rejected (unsupported)")
-	return fmt.Errorf("unsupported")
+	b.store.Clear()
+	b.logger.Info("agent call: Lock cleared stored Bitwarden session")
+	return nil
 }
 func (b *BitwardenAgent) Unlock(passphrase []byte) error {
-	b.logger.Warn("agent call: Unlock rejected (unsupported)")
+	b.logger.Warn("agent call: Unlock rejected (use ssh-add -L to trigger interactive unlock)")
 	return fmt.Errorf("unsupported")
 }
 func (b *BitwardenAgent) Signers() ([]ssh.Signer, error) {
