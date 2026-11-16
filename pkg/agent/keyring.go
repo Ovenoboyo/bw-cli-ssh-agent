@@ -13,9 +13,21 @@ const (
 	ClientSecKeyringDesc = "bw_client_secret"
 )
 
-func hasKeyctl() bool {
+// HasKeyctl reports whether the keyctl binary is available on PATH.
+func HasKeyctl() bool {
 	_, err := exec.LookPath("keyctl")
 	return err == nil
+}
+
+// HasKeyringEntry checks whether a non-empty user key with desc exists in @u
+// without returning its secret value.
+func HasKeyringEntry(desc string) bool {
+	sec, err := readKeyringRaw(desc)
+	if err != nil || len(sec) == 0 {
+		return false
+	}
+	zeroBytes(sec)
+	return true
 }
 
 func zeroBytes(b []byte) {

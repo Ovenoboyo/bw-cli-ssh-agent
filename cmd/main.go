@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/Ovenoboyo/bw-cli-ssh-agent/pkg/agent"
+	"github.com/Ovenoboyo/bw-cli-ssh-agent/pkg/doctor"
 	"github.com/Ovenoboyo/bw-cli-ssh-agent/pkg/logging"
 	"github.com/Ovenoboyo/bw-cli-ssh-agent/pkg/server"
 )
@@ -24,7 +25,20 @@ func main() {
 	storeAPIKey := flag.Bool("store-apikey", false, "Prompt for Bitwarden API key credentials, store them in kernel keyring, and exit")
 	clearAPIKey := flag.Bool("clear-apikey", false, "Remove stored Bitwarden API key credentials from kernel keyring and exit")
 	refreshCache := flag.Bool("refresh-cache", false, "Signal the running bw-ssh-agent daemon to refresh its public key cache")
+	doctorFlag := flag.Bool("doctor", false, "Check system dependencies, keyring, prompt tooling, and daemon status")
 	flag.Parse()
+
+	if *doctorFlag || flag.Arg(0) == "doctor" {
+		opts := doctor.Options{
+			SocketPath:  *sockPath,
+			PidFile:     *pidFile,
+			KeyringDesc: *keyringDesc,
+		}
+		if err := doctor.Run(os.Stdout, opts); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
 
 	logger, cleanup, err := logging.Setup(*logFile)
 	if err != nil {

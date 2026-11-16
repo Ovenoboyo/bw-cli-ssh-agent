@@ -12,7 +12,7 @@ import (
 // StoreAPIKey checks that keyctl and the user kernel keyring (@u) are available,
 // then prompts for the Bitwarden Personal API Key without echoing secrets and stores them.
 func StoreAPIKey() error {
-	if !hasKeyctl() {
+	if !HasKeyctl() {
 		return fmt.Errorf("keyctl is not installed; refusing to store API key without kernel keyring")
 	}
 	// Verify the user kernel keyring (@u) is active and writable in this session
@@ -53,7 +53,7 @@ func StoreAPIKey() error {
 // ClearAPIKey removes the stored Bitwarden API key credentials (bw_client_id and bw_client_secret)
 // from the Linux user kernel keyring (@u).
 func ClearAPIKey() (int, error) {
-	if !hasKeyctl() {
+	if !HasKeyctl() {
 		return 0, fmt.Errorf("keyctl is not installed; cannot clear API key from kernel keyring")
 	}
 

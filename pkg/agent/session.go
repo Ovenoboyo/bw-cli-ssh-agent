@@ -23,7 +23,7 @@ func newSessionStore(desc string, logger *slog.Logger) *sessionStore {
 		logger = slog.Default()
 	}
 
-	useKeyring := hasKeyctl()
+	useKeyring := HasKeyctl()
 	if !useKeyring {
 		logger.Warn("keyctl not installed; falling back to keeping BW_SESSION in memory")
 	}
