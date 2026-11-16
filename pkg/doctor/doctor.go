@@ -22,6 +22,7 @@ type Options struct {
 	StoreMasterPassword   bool
 	RequirePolkitOnUnlock bool
 	AllowAgentForwarding  bool
+	PolkitCacheTTLSeconds int
 }
 
 // Run inspects all dependencies, secret storage, prompt tooling, Bitwarden status,
@@ -69,11 +70,12 @@ func Run(w io.Writer, opts Options) error {
 
 	// 3. Config file & Secret Storage Backend (libsecret -> kernel keyring -> memory)
 	if opts.ConfigPath != "" {
-		pass("Config file", fmt.Sprintf("%s (store_master_password=%t, require_polkit_on_unlock=%t, allow_agent_forwarding=%t)",
+		pass("Config file", fmt.Sprintf("%s (store_master_password=%t, require_polkit_on_unlock=%t, allow_agent_forwarding=%t, polkit_cache_ttl_seconds=%d)",
 			opts.ConfigPath,
 			opts.StoreMasterPassword,
 			opts.RequirePolkitOnUnlock,
 			opts.AllowAgentForwarding,
+			opts.PolkitCacheTTLSeconds,
 		))
 	}
 
@@ -82,7 +84,7 @@ func Run(w io.Writer, opts Options) error {
 	case agent.BackendLibsecret:
 		pass("Secret storage", "libsecret (D-Bus Secret Service)")
 	case agent.BackendKeyring:
-		pass("Secret storage", "Linux kernel keyring (@u via native syscalls)")
+		pass("Secret storage", "Linux kernel keyring (@us via native syscalls)")
 	default:
 		warn("Secret storage", "memory-only fallback (neither libsecret nor kernel keyring available)")
 	}

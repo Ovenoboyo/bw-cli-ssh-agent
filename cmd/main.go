@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/Ovenoboyo/bw-cli-ssh-agent/pkg/agent"
 	"github.com/Ovenoboyo/bw-cli-ssh-agent/pkg/config"
@@ -39,6 +40,7 @@ func main() {
 	disablePolkitUnlock := flag.Bool("no-polkit-on-unlock", false, "Set require_polkit_on_unlock=false in config and exit")
 	enableForwarding := flag.Bool("allow-forwarding", false, "Set allow_agent_forwarding=true in config and exit")
 	disableForwarding := flag.Bool("no-allow-forwarding", false, "Set allow_agent_forwarding=false in config and exit")
+	polkitCacheTTL := flag.Int("polkit-cache-ttl", -1, "Set polkit_cache_ttl_seconds in config (0 to disable caching) and exit")
 	showConfig := flag.Bool("show-config", false, "Print the active configuration file path and JSON settings, then exit")
 	refreshCache := flag.Bool("refresh-cache", false, "Signal the running bw-ssh-agent daemon to refresh its public key cache")
 	doctorFlag := flag.Bool("doctor", false, "Check system dependencies, secret storage, prompt tooling, and daemon status")
@@ -64,6 +66,7 @@ func main() {
 			StoreMasterPassword:   appCfg.StoreMasterPassword,
 			RequirePolkitOnUnlock: appCfg.RequirePolkitOnUnlock,
 			AllowAgentForwarding:  appCfg.AllowAgentForwarding,
+			PolkitCacheTTLSeconds: appCfg.PolkitCacheTTLSeconds,
 		}
 		if err := doctor.Run(os.Stdout, opts); err != nil {
 			os.Exit(1)
@@ -78,7 +81,6 @@ func main() {
 	}
 	defer cleanup()
 
-	// Handle mutually conflicting config flags cleanly
 	if *enablePolkitUnlock && *disablePolkitUnlock {
 		logger.Error("cannot pass both --polkit-on-unlock and --no-polkit-on-unlock")
 		os.Exit(1)
@@ -88,7 +90,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Mutate config flags if any were specified (can be combined in one invocation)
 	configMutated := false
 	if *enablePolkitUnlock {
 		appCfg.RequirePolkitOnUnlock = true
@@ -106,6 +107,10 @@ func main() {
 		appCfg.AllowAgentForwarding = false
 		configMutated = true
 	}
+	if *polkitCacheTTL >= 0 {
+		appCfg.PolkitCacheTTLSeconds = *polkitCacheTTL
+		configMutated = true
+	}
 
 	if configMutated {
 		if *cfgPath == "" {
@@ -121,6 +126,7 @@ func main() {
 			"store_master_password", appCfg.StoreMasterPassword,
 			"require_polkit_on_unlock", appCfg.RequirePolkitOnUnlock,
 			"allow_agent_forwarding", appCfg.AllowAgentForwarding,
+			"polkit_cache_ttl_seconds", appCfg.PolkitCacheTTLSeconds,
 		)
 		if !*showConfig && !*storeMasterPw && !*clearMasterPw {
 			return
@@ -203,6 +209,7 @@ func main() {
 		appCfg.StoreMasterPassword,
 		appCfg.RequirePolkitOnUnlock,
 		appCfg.AllowAgentForwarding,
+		time.Duration(appCfg.PolkitCacheTTLSeconds)*time.Second,
 		logger,
 	)
 	cfg := server.Config{

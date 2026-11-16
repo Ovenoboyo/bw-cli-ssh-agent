@@ -23,6 +23,11 @@ type Config struct {
 	// AllowAgentForwarding permits SSH signing requests originating from forwarded
 	// SSH agent sessions (is_forwarding=1 in session-bind@openssh.com). Defaults to false.
 	AllowAgentForwarding bool `json:"allow_agent_forwarding"`
+
+	// PolkitCacheTTLSeconds specifies how long (in seconds) a successful Polkit
+	// authorization remains valid before re-prompting. Set to 0 (default) to prompt
+	// on every sign request.
+	PolkitCacheTTLSeconds int `json:"polkit_cache_ttl_seconds"`
 }
 
 // DefaultPath returns $XDG_CONFIG_HOME/bw-ssh-agent/config.json (or ~/.config/bw-ssh-agent/config.json).
@@ -53,11 +58,17 @@ func Load(path string) (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("failed to parse config %s: %w", path, err)
 	}
+	if cfg.PolkitCacheTTLSeconds < 0 {
+		cfg.PolkitCacheTTLSeconds = 0
+	}
 	return cfg, nil
 }
 
 // Save writes cfg to path with 0600 permissions, creating parent directories (0700) if needed.
 func Save(path string, cfg Config) error {
+	if cfg.PolkitCacheTTLSeconds < 0 {
+		cfg.PolkitCacheTTLSeconds = 0
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}

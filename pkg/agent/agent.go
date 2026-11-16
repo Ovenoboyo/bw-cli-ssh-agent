@@ -49,7 +49,11 @@ type cachedKey struct {
 type BitwardenAgent struct {
 	store           *sessionStore
 	allowForwarding bool
+	polkitCacheTTL  time.Duration
 	logger          *slog.Logger
+
+	polkitMu              sync.Mutex
+	polkitAuthorizedUntil time.Time
 
 	mu            sync.RWMutex
 	initialized   bool
@@ -58,14 +62,15 @@ type BitwardenAgent struct {
 	refreshing    atomic.Bool
 }
 
-// New creates a new BitwardenAgent with configurable Polkit unlock gating and agent forwarding policy.
-func New(secretKey string, storeMasterPw, requirePolkitOnUnlock, allowForwarding bool, logger *slog.Logger) *BitwardenAgent {
+// New creates a new BitwardenAgent with configurable Polkit gating, Polkit cache TTL, and forwarding policy.
+func New(secretKey string, storeMasterPw, requirePolkitOnUnlock, allowForwarding bool, polkitCacheTTL time.Duration, logger *slog.Logger) *BitwardenAgent {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &BitwardenAgent{
 		store:           newSessionStore(secretKey, storeMasterPw, requirePolkitOnUnlock, logger),
 		allowForwarding: allowForwarding,
+		polkitCacheTTL:  polkitCacheTTL,
 		logger:          logger,
 	}
 }
@@ -110,6 +115,28 @@ func (c *connAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags sshagent
 	}
 	c.logger.Info("sign request peer context", "peer_pid", c.peer.PID, "peer_comm", c.peer.Comm)
 	return c.BitwardenAgent.SignWithFlags(key, data, flags)
+}
+
+func (b *BitwardenAgent) authorizeWithCache(actionDesc string) error {
+	if b.polkitCacheTTL <= 0 {
+		return authorizeAction(actionDesc)
+	}
+
+	b.polkitMu.Lock()
+	defer b.polkitMu.Unlock()
+
+	if time.Now().Before(b.polkitAuthorizedUntil) {
+		b.logger.Info("polkit authorization satisfied via cached approval",
+			"remaining", time.Until(b.polkitAuthorizedUntil).Round(time.Second))
+		return nil
+	}
+
+	if err := authorizeAction(actionDesc); err != nil {
+		return err
+	}
+
+	b.polkitAuthorizedUntil = time.Now().Add(b.polkitCacheTTL)
+	return nil
 }
 
 func (b *BitwardenAgent) runBWWithRetry(args ...string) ([]byte, error) {
@@ -288,7 +315,7 @@ func (b *BitwardenAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ssh
 
 	b.logger.Info("agent call: Sign requested", "key_name", matchedName, "item_id", matchedID, "flags", flags)
 
-	if err := authorizeAction("sign SSH challenge with " + matchedName); err != nil {
+	if err := b.authorizeWithCache("sign SSH challenge with " + matchedName); err != nil {
 		b.logger.Warn("polkit authorization denied", "key_name", matchedName, "err", err)
 		return nil, err
 	}
@@ -350,19 +377,24 @@ func (b *BitwardenAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ssh
 	return sig, nil
 }
 
-// Lock clears stored credentials and wipes the in-memory public key cache.
+// Lock clears stored credentials, Polkit approval cache, and the in-memory public key cache.
 func (b *BitwardenAgent) Lock(passphrase []byte) error {
 	b.store.ClearAll()
+
+	b.polkitMu.Lock()
+	b.polkitAuthorizedUntil = time.Time{}
+	b.polkitMu.Unlock()
+
 	b.mu.Lock()
 	b.cache = nil
 	b.initialized = false
 	b.lastRefreshed = time.Time{}
 	b.mu.Unlock()
-	b.logger.Info("agent call: Lock cleared stored credentials and public key cache")
+	b.logger.Info("agent call: Lock cleared stored credentials, polkit cache, and public key cache")
 	return nil
 }
 
-// Unlock delegates authorization to Polkit, unlocks Bitwarden interactively, and refreshes the cache.
+// Unlock unlocks Bitwarden interactively and refreshes the public key cache.
 func (b *BitwardenAgent) Unlock(passphrase []byte) error {
 	b.logger.Info("agent call: Unlock requested")
 	if err := b.RefreshCache(); err != nil {
