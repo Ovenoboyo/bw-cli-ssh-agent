@@ -36,7 +36,6 @@ func buildPolkitProcessSubject(pid, uid int) (string, error) {
 	}
 	statStr := string(statBytes)
 
-	// Field 2 (comm) is wrapped in parentheses and may contain spaces; find the last ')'
 	closeParen := strings.LastIndexByte(statStr, ')')
 	if closeParen == -1 || closeParen+2 >= len(statStr) {
 		return "", fmt.Errorf("unexpected /proc/%d/stat format", pid)

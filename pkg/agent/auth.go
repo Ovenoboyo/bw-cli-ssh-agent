@@ -9,6 +9,8 @@ import (
 	"strings"
 )
 
+const maxUnlockAttempts = 3
+
 // LoginWithAPIKey prompts for the Bitwarden Personal API Key (client_id and client_secret)
 // without echoing secrets, passes them once to `bw login --apikey`, and zeroes them in memory.
 func LoginWithAPIKey() error {
@@ -58,7 +60,6 @@ func checkBWStatus() (string, error) {
 }
 
 func loginInteractive(s *sessionStore) error {
-	// If BW_CLIENTID / BW_CLIENTSECRET were explicitly supplied in the environment, use them
 	clientID := []byte(os.Getenv("BW_CLIENTID"))
 	clientSecret := []byte(os.Getenv("BW_CLIENTSECRET"))
 	defer zeroBytes(clientID)
@@ -78,13 +79,13 @@ func loginInteractive(s *sessionStore) error {
 	}
 
 	s.logger.Info("prompting for Bitwarden email and master password")
-	email, err := promptSecret("Bitwarden Login", "Enter your Bitwarden email:", false)
+	email, err := promptSecret("Bitwarden Login", "Enter your Bitwarden email:", false, "")
 	if err != nil {
 		return err
 	}
 	defer zeroBytes(email)
 
-	pw, err := promptSecret("Bitwarden Login", "Enter your Bitwarden master password:", true)
+	pw, err := promptSecret("Bitwarden Login", "Enter your Bitwarden master password:", true, "")
 	if err != nil {
 		return err
 	}
@@ -110,14 +111,86 @@ func unlockInteractive(s *sessionStore) ([]byte, error) {
 		return sec, nil
 	}
 
-	pw, err := promptSecret("Unlock Bitwarden Vault", "Enter your Bitwarden master password to unlock SSH keys:", true)
-	if err != nil {
-		return nil, err
-	}
-	defer zeroBytes(pw)
+	// 1. If store_master_password is enabled and a cached password exists, require Polkit first
+	if s.storeMasterPw {
+		var cachedPw []byte
+		switch s.backend {
+		case BackendLibsecret:
+			cachedPw, _ = readLibsecret(MasterPwSecretKey)
+		case BackendKeyring:
+			cachedPw, _ = readKeyringRaw(MasterPwKeyringDesc)
+		}
 
+		if len(cachedPw) > 0 {
+			defer zeroBytes(cachedPw)
+			if !s.requirePolkitOnUnlock {
+				s.logger.Info("cached master password found; requesting Polkit authorization")
+				if err := authorizeAction("unlock Bitwarden SSH agent"); err != nil {
+					return nil, err
+				}
+			}
+
+			if session, err := runBWUnlock(cachedPw); err == nil {
+				return session, nil
+			} else {
+				s.logger.Warn("cached master password rejected by bw unlock; clearing cached password and prompting interactively", "err", err)
+				switch s.backend {
+				case BackendLibsecret:
+					_ = clearLibsecret(MasterPwSecretKey)
+				case BackendKeyring:
+					_, _ = unlinkKeyringRaw(MasterPwKeyringDesc)
+				}
+			}
+		}
+	}
+
+	// 2. Interactive master password prompt with retry loop on wrong password (no redundant Polkit prompt)
+	cacheID := ""
+	if s.storeMasterPw {
+		cacheID = "bw-ssh-agent/master-password"
+	}
+
+	promptText := "Enter your Bitwarden master password to unlock SSH keys:"
+	for attempt := 1; attempt <= maxUnlockAttempts; attempt++ {
+		pw, err := promptSecret("Unlock Bitwarden Vault", promptText, true, cacheID)
+		if err != nil {
+			// User canceled prompt or prompt helper failed
+			return nil, err
+		}
+
+		session, unlockErr := runBWUnlock(pw)
+		if unlockErr == nil {
+			if s.storeMasterPw {
+				switch s.backend {
+				case BackendLibsecret:
+					if err := writeLibsecret(MasterPwSecretKey, pw); err == nil {
+						s.logger.Info("stored Bitwarden master password in libsecret")
+					}
+				case BackendKeyring:
+					if err := writeKeyringRaw(MasterPwKeyringDesc, pw, 0); err == nil {
+						s.logger.Info("stored Bitwarden master password in kernel keyring (@us)")
+					}
+				}
+			}
+			zeroBytes(pw)
+			return session, nil
+		}
+
+		zeroBytes(pw)
+		if !isInvalidMasterPassword(unlockErr.Error()) {
+			return nil, unlockErr
+		}
+
+		s.logger.Warn("invalid Bitwarden master password entered", "attempt", attempt, "max_attempts", maxUnlockAttempts)
+		promptText = fmt.Sprintf("Invalid master password (attempt %d/%d). Please try again:", attempt, maxUnlockAttempts)
+	}
+
+	return nil, fmt.Errorf("failed to unlock Bitwarden vault after %d attempts", maxUnlockAttempts)
+}
+
+func runBWUnlock(pw []byte) ([]byte, error) {
 	cmd := exec.Command("bw", "unlock", "--raw")
-	cmd.Stdin = bytes.NewReader(append(pw, '\n'))
+	cmd.Stdin = bytes.NewReader(append(append([]byte(nil), pw...), '\n'))
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -131,4 +204,11 @@ func unlockInteractive(s *sessionStore) ([]byte, error) {
 		return nil, fmt.Errorf("bw unlock returned empty session token")
 	}
 	return session, nil
+}
+
+func isInvalidMasterPassword(errMsg string) bool {
+	s := strings.ToLower(errMsg)
+	return strings.Contains(s, "invalid master password") ||
+		strings.Contains(s, "wrong password") ||
+		strings.Contains(s, "mac failed")
 }

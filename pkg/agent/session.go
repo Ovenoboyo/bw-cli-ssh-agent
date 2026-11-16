@@ -6,32 +6,36 @@ import (
 )
 
 type sessionStore struct {
-	desc       string
-	logger     *slog.Logger
-	useKeyring bool
+	desc                  string
+	storeMasterPw         bool
+	requirePolkitOnUnlock bool
+	logger                *slog.Logger
+	backend               SecretBackend
 
 	mu        sync.Mutex
 	unlockMu  sync.Mutex
 	memSecret []byte
 }
 
-func newSessionStore(desc string, logger *slog.Logger) *sessionStore {
+func newSessionStore(desc string, storeMasterPw, requirePolkitOnUnlock bool, logger *slog.Logger) *sessionStore {
 	if desc == "" {
-		desc = DefaultKeyringDesc
+		desc = DefaultSecretKey
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 
-	useKeyring := HasKeyctl()
-	if !useKeyring {
-		logger.Warn("keyctl not installed; falling back to keeping BW_SESSION in memory")
+	backend := DetectSecretBackend()
+	if backend == BackendMemory {
+		logger.Warn("neither libsecret nor kernel keyring available; falling back to keeping BW_SESSION in memory")
 	}
 
 	return &sessionStore{
-		desc:       desc,
-		logger:     logger,
-		useKeyring: useKeyring,
+		desc:                  desc,
+		storeMasterPw:         storeMasterPw,
+		requirePolkitOnUnlock: requirePolkitOnUnlock,
+		logger:                logger,
+		backend:               backend,
 	}
 }
 
@@ -39,7 +43,12 @@ func (s *sessionStore) Get() ([]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.useKeyring {
+	switch s.backend {
+	case BackendLibsecret:
+		if sec, err := readLibsecret(s.desc); err == nil && len(sec) > 0 {
+			return sec, true
+		}
+	case BackendKeyring:
 		if sec, err := readKeyringRaw(s.desc); err == nil && len(sec) > 0 {
 			return sec, true
 		}
@@ -57,14 +66,24 @@ func (s *sessionStore) Set(session []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.useKeyring {
+	switch s.backend {
+	case BackendLibsecret:
+		if err := writeLibsecret(s.desc, session); err == nil {
+			zeroBytes(s.memSecret)
+			s.memSecret = nil
+			return
+		} else {
+			s.logger.Warn("failed to store session in libsecret; falling back to memory", "err", err)
+			s.backend = BackendMemory
+		}
+	case BackendKeyring:
 		if err := writeKeyringRaw(s.desc, session, sessionKeyTTLSeconds); err == nil {
 			zeroBytes(s.memSecret)
 			s.memSecret = nil
 			return
 		} else {
 			s.logger.Warn("failed to store session in kernel keyring; falling back to memory", "err", err)
-			s.useKeyring = false
+			s.backend = BackendMemory
 		}
 	}
 
@@ -73,29 +92,41 @@ func (s *sessionStore) Set(session []byte) {
 	copy(s.memSecret, session)
 }
 
-func (s *sessionStore) Clear() {
+// ClearSessionOnly wipes BW_SESSION while keeping any cached master password intact.
+func (s *sessionStore) ClearSessionOnly() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	zeroBytes(s.memSecret)
 	s.memSecret = nil
 
-	if s.useKeyring {
+	switch s.backend {
+	case BackendLibsecret:
+		_ = clearLibsecret(s.desc)
+	case BackendKeyring:
 		_, _ = unlinkKeyringRaw(s.desc)
 	}
 }
 
-func (s *sessionStore) storageBackendName() string {
+// ClearAll wipes both BW_SESSION and any cached master password (called on explicit Lock).
+func (s *sessionStore) ClearAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.useKeyring {
-		return "kernel-keyring"
+
+	zeroBytes(s.memSecret)
+	s.memSecret = nil
+
+	switch s.backend {
+	case BackendLibsecret:
+		_ = clearLibsecret(s.desc)
+		_ = clearLibsecret(MasterPwSecretKey)
+	case BackendKeyring:
+		_, _ = unlinkKeyringRaw(s.desc)
+		_, _ = unlinkKeyringRaw(MasterPwKeyringDesc)
 	}
-	return "memory"
 }
 
-// EnsureSession returns a valid BW_SESSION, delegating unlock authorization to Polkit
-// and then blocking on an interactive prompt to login/unlock if needed.
+// EnsureSession returns a valid BW_SESSION, prompting interactively if locked/unauthenticated.
 func (s *sessionStore) EnsureSession() ([]byte, error) {
 	if sec, ok := s.Get(); ok {
 		return sec, nil
@@ -108,10 +139,12 @@ func (s *sessionStore) EnsureSession() ([]byte, error) {
 		return sec, nil
 	}
 
-	s.logger.Info("no active Bitwarden session found; requesting Polkit authorization to unlock")
-	if err := authorizeAction("unlock Bitwarden SSH agent"); err != nil {
-		s.logger.Warn("polkit unlock authorization denied", "err", err)
-		return nil, err
+	if s.requirePolkitOnUnlock {
+		s.logger.Info("require_polkit_on_unlock is enabled; requesting Polkit authorization")
+		if err := authorizeAction("unlock Bitwarden SSH agent"); err != nil {
+			s.logger.Warn("polkit unlock authorization denied", "err", err)
+			return nil, err
+		}
 	}
 
 	status, err := checkBWStatus()
@@ -131,6 +164,6 @@ func (s *sessionStore) EnsureSession() ([]byte, error) {
 	}
 
 	s.Set(session)
-	s.logger.Info("Bitwarden vault unlocked and session stored", "storage", s.storageBackendName())
+	s.logger.Info("Bitwarden vault unlocked and session stored", "storage", s.backend)
 	return session, nil
 }

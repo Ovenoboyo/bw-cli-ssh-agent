@@ -21,6 +21,14 @@ const (
 	selfHealCooldown = 10 * time.Second
 )
 
+// PeerInfo identifies the local client process connected to the Unix domain socket.
+type PeerInfo struct {
+	PID  int32
+	UID  uint32
+	GID  uint32
+	Comm string
+}
+
 type bwItem struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
@@ -37,12 +45,29 @@ type cachedKey struct {
 	AgentID *sshagent.Key
 }
 
-// PeerInfo identifies the local client process connected to the Unix domain socket.
-type PeerInfo struct {
-	PID  int32
-	UID  uint32
-	GID  uint32
-	Comm string
+// BitwardenAgent implements sshagent.ExtendedAgent backed by Bitwarden CLI.
+type BitwardenAgent struct {
+	store           *sessionStore
+	allowForwarding bool
+	logger          *slog.Logger
+
+	mu            sync.RWMutex
+	initialized   bool
+	lastRefreshed time.Time
+	cache         []cachedKey
+	refreshing    atomic.Bool
+}
+
+// New creates a new BitwardenAgent with configurable Polkit unlock gating and agent forwarding policy.
+func New(secretKey string, storeMasterPw, requirePolkitOnUnlock, allowForwarding bool, logger *slog.Logger) *BitwardenAgent {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &BitwardenAgent{
+		store:           newSessionStore(secretKey, storeMasterPw, requirePolkitOnUnlock, logger),
+		allowForwarding: allowForwarding,
+		logger:          logger,
+	}
 }
 
 type connAgent struct {
@@ -59,12 +84,22 @@ func (b *BitwardenAgent) ServeConn(c net.Conn, peer PeerInfo) error {
 
 func (c *connAgent) Extension(extensionType string, contents []byte) ([]byte, error) {
 	if extensionType == "session-bind@openssh.com" {
-		c.forwarded.Store(true)
-		c.logger.Warn("agent forwarding detected on connection; signing will be blocked",
-			"peer_pid", c.peer.PID, "peer_comm", c.peer.Comm)
-		return nil, fmt.Errorf("agent forwarding is disabled for security")
+		// OpenSSH session-bind payload ends with a 1-byte boolean `is_forwarding`
+		isForwarded := len(contents) > 0 && contents[len(contents)-1] == 1
+		if isForwarded && !c.allowForwarding {
+			c.forwarded.Store(true)
+			c.logger.Warn("forwarded SSH agent session detected; signing will be blocked",
+				"peer_pid", c.peer.PID, "peer_comm", c.peer.Comm)
+			return nil, fmt.Errorf("agent forwarding is disabled in config")
+		}
+		// Acknowledge local session binding (or allowed forwarding) per OpenSSH protocol
+		return nil, nil
 	}
 	return c.BitwardenAgent.Extension(extensionType, contents)
+}
+
+func (c *connAgent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
+	return c.SignWithFlags(key, data, 0)
 }
 
 func (c *connAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags sshagent.SignatureFlags) (*ssh.Signature, error) {
@@ -75,29 +110,6 @@ func (c *connAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags sshagent
 	}
 	c.logger.Info("sign request peer context", "peer_pid", c.peer.PID, "peer_comm", c.peer.Comm)
 	return c.BitwardenAgent.SignWithFlags(key, data, flags)
-}
-
-// BitwardenAgent implements sshagent.ExtendedAgent backed by Bitwarden CLI.
-type BitwardenAgent struct {
-	store  *sessionStore
-	logger *slog.Logger
-
-	mu            sync.RWMutex
-	initialized   bool
-	lastRefreshed time.Time
-	cache         []cachedKey
-	refreshing    atomic.Bool
-}
-
-// New creates a new BitwardenAgent with keyring + in-memory fallback session management.
-func New(keyringDesc string, logger *slog.Logger) *BitwardenAgent {
-	if logger == nil {
-		logger = slog.Default()
-	}
-	return &BitwardenAgent{
-		store:  newSessionStore(keyringDesc, logger),
-		logger: logger,
-	}
 }
 
 func (b *BitwardenAgent) runBWWithRetry(args ...string) ([]byte, error) {
@@ -123,7 +135,7 @@ func (b *BitwardenAgent) runBWWithRetry(args ...string) ([]byte, error) {
 		errText := stderr.String()
 		if attempt == 0 && isSessionInvalid(errText) {
 			b.logger.Warn("Bitwarden session expired or locked; clearing and re-prompting")
-			b.store.Clear()
+			b.store.ClearSessionOnly()
 			continue
 		}
 		return nil, fmt.Errorf("bw %v failed: %w (%s)", args, err, errText)
@@ -183,8 +195,6 @@ func (b *BitwardenAgent) RefreshCache() error {
 	return nil
 }
 
-// maybeTriggerBackgroundRefresh refreshes the cache asynchronously if >30m have elapsed
-// and a session is already unlocked (never pops up a surprise prompt in the background).
 func (b *BitwardenAgent) maybeTriggerBackgroundRefresh() {
 	b.mu.RLock()
 	stale := b.initialized && time.Since(b.lastRefreshed) > cacheTTL
@@ -269,7 +279,10 @@ func (b *BitwardenAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ssh
 	}
 
 	if matchedID == "" {
-		b.logger.Warn("agent call: Sign rejected (unknown key)", "key_type", key.Type())
+		b.logger.Warn("agent call: Sign rejected (unknown key)",
+			"key_type", key.Type(),
+			"fingerprint", ssh.FingerprintSHA256(key),
+		)
 		return nil, fmt.Errorf("matching key not found in cache")
 	}
 
@@ -283,7 +296,6 @@ func (b *BitwardenAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ssh
 
 	rawItem, err := b.runBWWithRetry("get", "item", matchedID)
 	if err != nil {
-		// Self-heal: item ID may have changed if key was recreated in Bitwarden
 		b.logger.Warn("bw get item failed; refreshing cache and retrying once", "item_id", matchedID, "err", err)
 		if refErr := b.RefreshCache(); refErr == nil {
 			if newID, newName := b.lookupKey(targetBlob); newID != "" {
@@ -338,15 +350,15 @@ func (b *BitwardenAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ssh
 	return sig, nil
 }
 
-// Lock clears the stored Bitwarden session and wipes the in-memory public key cache.
+// Lock clears stored credentials and wipes the in-memory public key cache.
 func (b *BitwardenAgent) Lock(passphrase []byte) error {
-	b.store.Clear()
+	b.store.ClearAll()
 	b.mu.Lock()
 	b.cache = nil
 	b.initialized = false
 	b.lastRefreshed = time.Time{}
 	b.mu.Unlock()
-	b.logger.Info("agent call: Lock cleared stored Bitwarden session and public key cache")
+	b.logger.Info("agent call: Lock cleared stored credentials and public key cache")
 	return nil
 }
 

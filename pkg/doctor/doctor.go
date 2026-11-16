@@ -13,18 +13,22 @@ import (
 	"github.com/Ovenoboyo/bw-cli-ssh-agent/pkg/agent"
 )
 
-// Options configures environment paths checked by Run.
+// Options configures environment paths and settings checked by Run.
 type Options struct {
-	SocketPath  string
-	PidFile     string
-	KeyringDesc string
+	SocketPath            string
+	PidFile               string
+	ConfigPath            string
+	SecretKey             string
+	StoreMasterPassword   bool
+	RequirePolkitOnUnlock bool
+	AllowAgentForwarding  bool
 }
 
-// Run inspects all dependencies, keyring entries, prompt tooling, Bitwarden status,
+// Run inspects all dependencies, secret storage, prompt tooling, Bitwarden status,
 // and daemon state, printing a diagnostic report to w without exposing secret values.
 func Run(w io.Writer, opts Options) error {
-	if opts.KeyringDesc == "" {
-		opts.KeyringDesc = agent.DefaultKeyringDesc
+	if opts.SecretKey == "" {
+		opts.SecretKey = agent.DefaultSecretKey
 	}
 
 	hasErrors := false
@@ -56,29 +60,46 @@ func Run(w io.Writer, opts Options) error {
 	}
 
 	// 2. Interactive prompt backend
-	promptBackend, promptErr := detectPromptBackend()
+	promptBackend, promptErr := agent.DetectPromptBackend()
 	if promptErr == nil {
 		pass("Interactive prompt", promptBackend)
 	} else {
 		warn("Interactive prompt", promptErr.Error())
 	}
 
-	// 3. Kernel keyring & stored credentials (existence only — never print secrets)
-	keyringReady := false
-	if kcPath, err := exec.LookPath("keyctl"); err != nil {
-		warn("Kernel keyring (keyctl)", "not installed (will fall back to in-memory session storage)")
-	} else if err := exec.Command("keyctl", "show", "@u").Run(); err != nil {
-		warn("Kernel keyring (@u)", fmt.Sprintf("%s found, but user keyring @u is unavailable: %v", kcPath, err))
-	} else {
-		keyringReady = true
-		pass("Kernel keyring (@u)", fmt.Sprintf("available (%s)", kcPath))
+	// 3. Config file & Secret Storage Backend (libsecret -> kernel keyring -> memory)
+	if opts.ConfigPath != "" {
+		pass("Config file", fmt.Sprintf("%s (store_master_password=%t, require_polkit_on_unlock=%t, allow_agent_forwarding=%t)",
+			opts.ConfigPath,
+			opts.StoreMasterPassword,
+			opts.RequirePolkitOnUnlock,
+			opts.AllowAgentForwarding,
+		))
 	}
 
-	if keyringReady {
-		if agent.HasKeyringEntry(opts.KeyringDesc) {
-			pass("Stored BW_SESSION", fmt.Sprintf("present in @u (%s)", opts.KeyringDesc))
+	backend := agent.DetectSecretBackend()
+	switch backend {
+	case agent.BackendLibsecret:
+		pass("Secret storage", "libsecret (D-Bus Secret Service)")
+	case agent.BackendKeyring:
+		pass("Secret storage", "Linux kernel keyring (@u via native syscalls)")
+	default:
+		warn("Secret storage", "memory-only fallback (neither libsecret nor kernel keyring available)")
+	}
+
+	if backend != agent.BackendMemory {
+		if agent.HasStoredSecret(opts.SecretKey) {
+			pass("Stored BW_SESSION", fmt.Sprintf("present in %s (%s)", backend, opts.SecretKey))
 		} else {
-			warn("Stored BW_SESSION", fmt.Sprintf("not found in @u (%s) — will prompt on first use", opts.KeyringDesc))
+			warn("Stored BW_SESSION", fmt.Sprintf("not found in %s (%s) — will prompt on first use", backend, opts.SecretKey))
+		}
+
+		if opts.StoreMasterPassword {
+			if agent.HasStoredSecret(agent.MasterPwSecretKey) {
+				pass("Stored master password", fmt.Sprintf("present in %s (%s)", backend, agent.MasterPwSecretKey))
+			} else {
+				warn("Stored master password", fmt.Sprintf("enabled in config, not yet cached in %s (will store on next unlock)", backend))
+			}
 		}
 	}
 
@@ -128,19 +149,6 @@ func Run(w io.Writer, opts Options) error {
 		return fmt.Errorf("one or more required dependencies are missing")
 	}
 	return nil
-}
-
-func detectPromptBackend() (string, error) {
-	for _, bin := range []string{"zenity", "kdialog", "yad", "systemd-ask-password"} {
-		if path, err := exec.LookPath(bin); err == nil {
-			return fmt.Sprintf("%s (%s)", bin, path), nil
-		}
-	}
-	if tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0); err == nil {
-		tty.Close()
-		return "/dev/tty (controlling terminal fallback)", nil
-	}
-	return "", fmt.Errorf("no GUI askpass helper (zenity/kdialog/yad/systemd-ask-password) and no /dev/tty available")
 }
 
 func inspectBWStatus() (string, string, error) {
