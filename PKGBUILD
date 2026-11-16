@@ -1,12 +1,14 @@
 # Maintainer: Ovenoboyo <your-email@example.com>
-pkgname=bw-ssh-agent
-_repo=bw-ssh-agent
-pkgver=0.1.0
+pkgname=bw-ssh-agent-git
+_pkgname=bw-ssh-agent
+pkgver=r10.g914c1e2
 pkgrel=1
 pkgdesc="Hardened SSH agent backed by Bitwarden CLI with Polkit and Pinentry support"
 arch=('x86_64' 'aarch64')
-url="https://github.com/Ovenoboyo/${_repo}"
+url="https://github.com/Ovenoboyo/bw-cli-ssh-agent"
 license=('MIT')
+provides=("${_pkgname}")
+conflicts=("${_pkgname}")
 depends=(
   'bitwarden-cli'
   'polkit'
@@ -18,36 +20,44 @@ optdepends=(
   'zenity: GTK fallback password dialog'
   'kdialog: KDE fallback password dialog'
 )
-makedepends=('go')
-source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+makedepends=(
+  'git'
+  'go'
+)
+source=("${_pkgname}::git+https://github.com/Ovenoboyo/bw-cli-ssh-agent.git#branch=main")
 sha256sums=('SKIP')
 
+pkgver() {
+  cd "${srcdir}/${_pkgname}"
+  printf "r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
 prepare() {
-  cd "${srcdir}/${_repo}-${pkgver}"
+  cd "${srcdir}/${_pkgname}"
   export GOPATH="${srcdir}/go"
+  export GOFLAGS="-modcacherw"
   go mod download -x
 }
 
 build() {
-  cd "${srcdir}/${_repo}-${pkgver}"
+  cd "${srcdir}/${_pkgname}"
   export CGO_ENABLED=0
   export GOPATH="${srcdir}/go"
-  export GOFLAGS="-buildmode=pie -trimpath -mod=readonly -modcacherw"
+  export GOFLAGS="-trimpath -mod=readonly -modcacherw"
 
-  go build -ldflags="-s -w -linkmode=external" -o "${pkgname}" ./cmd
+  go build -ldflags="-s -w" -o "${_pkgname}" ./cmd
 }
 
 package() {
-  cd "${srcdir}/${_repo}-${pkgver}"
+  cd "${srcdir}/${_pkgname}"
 
-  install -Dm755 "${pkgname}" "${pkgdir}/usr/bin/${pkgname}"
+  install -Dm755 "${_pkgname}" "${pkgdir}/usr/bin/${_pkgname}"
 
   install -Dm644 /dev/stdin "${pkgdir}/usr/lib/systemd/user/bw-ssh-agent.service" << 'EOF'
 [Unit]
 Description=Bitwarden CLI SSH Agent
-Documentation=https://github.com/Ovenoboyo/bw-ssh-agent
+Documentation=https://github.com/Ovenoboyo/bw-cli-ssh-agent
 After=graphical-session.target
-PartOf=graphical-session.target
 
 [Service]
 Type=simple
@@ -56,13 +66,8 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 
-NoNewPrivileges=false
-ProtectSystem=strict
-ProtectHome=read-only
-PrivateTmp=true
-
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target
 EOF
 
   install -Dm644 /dev/stdin "${pkgdir}/usr/lib/environment.d/90-bw-ssh-agent.conf" << 'EOF'
