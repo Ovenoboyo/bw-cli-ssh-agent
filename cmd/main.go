@@ -13,13 +13,17 @@ import (
 )
 
 func main() {
-	defaultSock := filepath.Join(os.Getenv("XDG_RUNTIME_DIR"), "bw-ssh-agent.sock")
+	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
+	defaultSock := filepath.Join(runtimeDir, "bw-ssh-agent.sock")
+	defaultPid := filepath.Join(runtimeDir, "bw-ssh-agent.pid")
 
 	sockPath := flag.String("socket", defaultSock, "Path to the Unix domain socket")
+	pidFile := flag.String("pid-file", defaultPid, "Path to the daemon PID file")
 	keyringDesc := flag.String("keyring-desc", agent.DefaultKeyringDesc, "Kernel keyring description holding BW_SESSION")
 	logFile := flag.String("log-file", "", "Optional path to write logs (defaults to stderr)")
 	storeAPIKey := flag.Bool("store-apikey", false, "Prompt for Bitwarden API key credentials, store them in kernel keyring, and exit")
 	clearAPIKey := flag.Bool("clear-apikey", false, "Remove stored Bitwarden API key credentials from kernel keyring and exit")
+	refreshCache := flag.Bool("refresh-cache", false, "Signal the running bw-ssh-agent daemon to refresh its public key cache")
 	flag.Parse()
 
 	logger, cleanup, err := logging.Setup(*logFile)
@@ -28,6 +32,15 @@ func main() {
 		os.Exit(1)
 	}
 	defer cleanup()
+
+	if *refreshCache {
+		if err := server.TriggerRefresh(*pidFile); err != nil {
+			logger.Error("failed to trigger cache refresh", "err", err)
+			os.Exit(1)
+		}
+		logger.Info("sent cache refresh signal to running bw-ssh-agent")
+		return
+	}
 
 	if *clearAPIKey {
 		removed, err := agent.ClearAPIKey()
@@ -55,6 +68,7 @@ func main() {
 	bwAgent := agent.New(*keyringDesc, logger)
 	cfg := server.Config{
 		SocketPath: *sockPath,
+		PidFile:    *pidFile,
 		Logger:     logger,
 	}
 

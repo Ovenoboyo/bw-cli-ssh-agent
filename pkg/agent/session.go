@@ -35,7 +35,6 @@ func newSessionStore(desc string, logger *slog.Logger) *sessionStore {
 	}
 }
 
-// Get returns a copy of the cached session token if present in keyring or memory.
 func (s *sessionStore) Get() ([]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -54,7 +53,6 @@ func (s *sessionStore) Get() ([]byte, bool) {
 	return nil, false
 }
 
-// Set persists the session token to the kernel keyring, falling back to RAM with a warning on failure.
 func (s *sessionStore) Set(session []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -75,7 +73,6 @@ func (s *sessionStore) Set(session []byte) {
 	copy(s.memSecret, session)
 }
 
-// Clear wipes any stored session token (used when bw reports the token expired or Lock() is called).
 func (s *sessionStore) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -97,13 +94,13 @@ func (s *sessionStore) storageBackendName() string {
 	return "memory"
 }
 
-// EnsureSession returns a valid BW_SESSION, blocking on an interactive prompt to login/unlock if needed.
+// EnsureSession returns a valid BW_SESSION, delegating unlock authorization to Polkit
+// and then blocking on an interactive prompt to login/unlock if needed.
 func (s *sessionStore) EnsureSession() ([]byte, error) {
 	if sec, ok := s.Get(); ok {
 		return sec, nil
 	}
 
-	// Serialize interactive prompts so concurrent ssh calls wait for a single unlock dialog
 	s.unlockMu.Lock()
 	defer s.unlockMu.Unlock()
 
@@ -111,7 +108,11 @@ func (s *sessionStore) EnsureSession() ([]byte, error) {
 		return sec, nil
 	}
 
-	s.logger.Info("no active Bitwarden session found; prompting user to unlock")
+	s.logger.Info("no active Bitwarden session found; requesting Polkit authorization to unlock")
+	if err := authorizeAction("unlock Bitwarden SSH agent"); err != nil {
+		s.logger.Warn("polkit unlock authorization denied", "err", err)
+		return nil, err
+	}
 
 	status, err := checkBWStatus()
 	if err != nil {

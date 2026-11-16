@@ -8,10 +8,16 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 	sshagent "golang.org/x/crypto/ssh/agent"
+)
+
+const (
+	cacheTTL         = 30 * time.Minute
+	selfHealCooldown = 10 * time.Second
 )
 
 type bwItem struct {
@@ -35,9 +41,11 @@ type BitwardenAgent struct {
 	store  *sessionStore
 	logger *slog.Logger
 
-	mu          sync.RWMutex
-	initialized bool
-	cache       []cachedKey
+	mu            sync.RWMutex
+	initialized   bool
+	lastRefreshed time.Time
+	cache         []cachedKey
+	refreshing    atomic.Bool
 }
 
 // New creates a new BitwardenAgent with keyring + in-memory fallback session management.
@@ -51,7 +59,6 @@ func New(keyringDesc string, logger *slog.Logger) *BitwardenAgent {
 	}
 }
 
-// runBWWithRetry executes a bw subcommand with BW_SESSION, prompting to unlock if missing or expired.
 func (b *BitwardenAgent) runBWWithRetry(args ...string) ([]byte, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		session, err := b.store.EnsureSession()
@@ -85,6 +92,9 @@ func (b *BitwardenAgent) runBWWithRetry(args ...string) ([]byte, error) {
 
 // RefreshCache fetches only public key metadata from Bitwarden and stores it in RAM.
 func (b *BitwardenAgent) RefreshCache() error {
+	b.refreshing.Store(true)
+	defer b.refreshing.Store(false)
+
 	start := time.Now()
 	b.logger.Info("refreshing public key cache")
 
@@ -125,13 +135,45 @@ func (b *BitwardenAgent) RefreshCache() error {
 	b.mu.Lock()
 	b.cache = updated
 	b.initialized = true
+	b.lastRefreshed = time.Now()
 	b.mu.Unlock()
 
 	b.logger.Info("public key cache updated", "count", len(updated), "duration", time.Since(start))
 	return nil
 }
 
-// List ensures the vault has been unlocked at least once to populate public keys, then serves from cache.
+// maybeTriggerBackgroundRefresh refreshes the cache asynchronously if >30m have elapsed
+// and a session is already unlocked (never pops up a surprise prompt in the background).
+func (b *BitwardenAgent) maybeTriggerBackgroundRefresh() {
+	b.mu.RLock()
+	stale := b.initialized && time.Since(b.lastRefreshed) > cacheTTL
+	b.mu.RUnlock()
+
+	if !stale || b.refreshing.Load() {
+		return
+	}
+
+	if sec, ok := b.store.Get(); ok {
+		zeroBytes(sec)
+		go func() {
+			b.logger.Info("cache TTL (30m) exceeded; refreshing public keys in background")
+			_ = b.RefreshCache()
+		}()
+	}
+}
+
+func (b *BitwardenAgent) lookupKey(targetBlob []byte) (string, string) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for _, k := range b.cache {
+		if bytes.Equal(k.AgentID.Blob, targetBlob) {
+			return k.ID, k.Name
+		}
+	}
+	return "", ""
+}
+
+// List serves cached public keys, initializing on first call and triggering background refresh after 30m.
 func (b *BitwardenAgent) List() ([]*sshagent.Key, error) {
 	b.mu.RLock()
 	init := b.initialized
@@ -141,6 +183,8 @@ func (b *BitwardenAgent) List() ([]*sshagent.Key, error) {
 		if err := b.RefreshCache(); err != nil {
 			return nil, err
 		}
+	} else {
+		b.maybeTriggerBackgroundRefresh()
 	}
 
 	b.mu.RLock()
@@ -163,7 +207,9 @@ func (b *BitwardenAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ssh
 
 	b.mu.RLock()
 	init := b.initialized
+	lastRef := b.lastRefreshed
 	b.mu.RUnlock()
+
 	if !init {
 		if err := b.RefreshCache(); err != nil {
 			return nil, err
@@ -171,17 +217,15 @@ func (b *BitwardenAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ssh
 	}
 
 	targetBlob := key.Marshal()
+	matchedID, matchedName := b.lookupKey(targetBlob)
 
-	b.mu.RLock()
-	var matchedID, matchedName string
-	for _, k := range b.cache {
-		if bytes.Equal(k.AgentID.Blob, targetBlob) {
-			matchedID = k.ID
-			matchedName = k.Name
-			break
+	// Self-heal: if key isn't in cache and we haven't refreshed recently, reload cache once
+	if matchedID == "" && time.Since(lastRef) > selfHealCooldown {
+		b.logger.Info("requested key not in cache; attempting self-heal cache refresh", "key_type", key.Type())
+		if err := b.RefreshCache(); err == nil {
+			matchedID, matchedName = b.lookupKey(targetBlob)
 		}
 	}
-	b.mu.RUnlock()
 
 	if matchedID == "" {
 		b.logger.Warn("agent call: Sign rejected (unknown key)", "key_type", key.Type())
@@ -190,7 +234,7 @@ func (b *BitwardenAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ssh
 
 	b.logger.Info("agent call: Sign requested", "key_name", matchedName, "item_id", matchedID, "flags", flags)
 
-	if err := authorizeSign(matchedName); err != nil {
+	if err := authorizeAction("sign SSH challenge with " + matchedName); err != nil {
 		b.logger.Warn("polkit authorization denied", "key_name", matchedName, "err", err)
 		return nil, err
 	}
@@ -198,8 +242,18 @@ func (b *BitwardenAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ssh
 
 	rawItem, err := b.runBWWithRetry("get", "item", matchedID)
 	if err != nil {
-		b.logger.Error("bw get item failed", "item_id", matchedID, "err", err)
-		return nil, err
+		// Self-heal: item ID may have changed if key was recreated in Bitwarden
+		b.logger.Warn("bw get item failed; refreshing cache and retrying once", "item_id", matchedID, "err", err)
+		if refErr := b.RefreshCache(); refErr == nil {
+			if newID, newName := b.lookupKey(targetBlob); newID != "" {
+				matchedID, matchedName = newID, newName
+				rawItem, err = b.runBWWithRetry("get", "item", matchedID)
+			}
+		}
+		if err != nil {
+			b.logger.Error("bw get item failed after self-heal", "item_id", matchedID, "err", err)
+			return nil, err
+		}
 	}
 	defer zeroBytes(rawItem)
 
@@ -243,6 +297,29 @@ func (b *BitwardenAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags ssh
 	return sig, nil
 }
 
+// Lock clears the stored Bitwarden session and wipes the in-memory public key cache.
+func (b *BitwardenAgent) Lock(passphrase []byte) error {
+	b.store.Clear()
+	b.mu.Lock()
+	b.cache = nil
+	b.initialized = false
+	b.lastRefreshed = time.Time{}
+	b.mu.Unlock()
+	b.logger.Info("agent call: Lock cleared stored Bitwarden session and public key cache")
+	return nil
+}
+
+// Unlock delegates authorization to Polkit, unlocks Bitwarden interactively, and refreshes the cache.
+func (b *BitwardenAgent) Unlock(passphrase []byte) error {
+	b.logger.Info("agent call: Unlock requested")
+	if err := b.RefreshCache(); err != nil {
+		b.logger.Error("agent call: Unlock failed", "err", err)
+		return err
+	}
+	b.logger.Info("agent call: Unlock completed and cache refreshed")
+	return nil
+}
+
 // Read-only stubs required to satisfy sshagent.ExtendedAgent
 func (b *BitwardenAgent) Add(key sshagent.AddedKey) error {
 	b.logger.Warn("agent call: Add rejected (read-only)")
@@ -255,15 +332,6 @@ func (b *BitwardenAgent) Remove(key ssh.PublicKey) error {
 func (b *BitwardenAgent) RemoveAll() error {
 	b.logger.Warn("agent call: RemoveAll rejected (read-only)")
 	return fmt.Errorf("read-only agent")
-}
-func (b *BitwardenAgent) Lock(passphrase []byte) error {
-	b.store.Clear()
-	b.logger.Info("agent call: Lock cleared stored Bitwarden session")
-	return nil
-}
-func (b *BitwardenAgent) Unlock(passphrase []byte) error {
-	b.logger.Warn("agent call: Unlock rejected (use ssh-add -L to trigger interactive unlock)")
-	return fmt.Errorf("unsupported")
 }
 func (b *BitwardenAgent) Signers() ([]ssh.Signer, error) {
 	return nil, fmt.Errorf("unsupported")

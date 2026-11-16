@@ -6,8 +6,8 @@ import (
 	"os/exec"
 )
 
-// authorizeSign triggers Polkit verification using the built-in exec action ID.
-func authorizeSign(keyName string) error {
+// authorizeAction triggers Polkit verification using the built-in exec action ID.
+func authorizeAction(actionDesc string) error {
 	pid := fmt.Sprintf("%d", os.Getpid())
 	cmd := exec.Command(
 		"pkcheck",
@@ -16,7 +16,7 @@ func authorizeSign(keyName string) error {
 		"--allow-user-interaction",
 	)
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("polkit authorization denied for %s: %w", keyName, err)
+		return fmt.Errorf("polkit authorization denied (%s): %w", actionDesc, err)
 	}
 	return nil
 }

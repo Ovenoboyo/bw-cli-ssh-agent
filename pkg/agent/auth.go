@@ -9,11 +9,15 @@ import (
 	"strings"
 )
 
-// StoreAPIKey prompts for the Bitwarden Personal API Key (client_id and client_secret)
-// without echoing secrets and stores them in the Linux user kernel keyring (@u).
+// StoreAPIKey checks that keyctl and the user kernel keyring (@u) are available,
+// then prompts for the Bitwarden Personal API Key without echoing secrets and stores them.
 func StoreAPIKey() error {
 	if !hasKeyctl() {
-		return fmt.Errorf("keyctl is not installed; cannot store API key in kernel keyring")
+		return fmt.Errorf("keyctl is not installed; refusing to store API key without kernel keyring")
+	}
+	// Verify the user kernel keyring (@u) is active and writable in this session
+	if err := exec.Command("keyctl", "show", "@u").Run(); err != nil {
+		return fmt.Errorf("user kernel keyring (@u) is unavailable; refusing to store API key: %w", err)
 	}
 
 	clientID, err := readSecretInput("Bitwarden API Key", "Enter Bitwarden Client ID (e.g. user.xxxx): ", false)

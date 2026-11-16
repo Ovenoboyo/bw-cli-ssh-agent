@@ -9,6 +9,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -20,7 +22,28 @@ import (
 // Config holds runtime parameters for the SSH agent Unix socket server.
 type Config struct {
 	SocketPath string
+	PidFile    string
 	Logger     *slog.Logger
+}
+
+// TriggerRefresh reads the running daemon's PID from pidFile and sends SIGHUP to reload its cache.
+func TriggerRefresh(pidFile string) error {
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		return fmt.Errorf("failed to read pid file %s (is bw-ssh-agent running?): %w", pidFile, err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return fmt.Errorf("invalid pid in %s: %w", pidFile, err)
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("process %d not found: %w", pid, err)
+	}
+	if err := proc.Signal(syscall.SIGHUP); err != nil {
+		return fmt.Errorf("failed to send SIGHUP to pid %d: %w", pid, err)
+	}
+	return nil
 }
 
 // Run starts the Unix socket listener, handles SIGHUP cache reloads,
@@ -31,7 +54,6 @@ func Run(ctx context.Context, cfg Config, bwAgent *agent.BitwardenAgent) error {
 		logger = slog.Default()
 	}
 
-	// Remove stale socket if left behind from an ungraceful exit
 	_ = os.Remove(cfg.SocketPath)
 
 	listener, err := net.Listen("unix", cfg.SocketPath)
@@ -42,6 +64,11 @@ func Run(ctx context.Context, cfg Config, bwAgent *agent.BitwardenAgent) error {
 		listener.Close()
 		_ = os.Remove(cfg.SocketPath)
 		return fmt.Errorf("failed to chmod socket %s: %w", cfg.SocketPath, err)
+	}
+
+	if cfg.PidFile != "" {
+		_ = os.WriteFile(cfg.PidFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0600)
+		defer os.Remove(cfg.PidFile)
 	}
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
@@ -71,7 +98,7 @@ func Run(ctx context.Context, cfg Config, bwAgent *agent.BitwardenAgent) error {
 		listener.Close()
 	}()
 
-	logger.Info("bw-ssh-agent listening", "socket", cfg.SocketPath)
+	logger.Info("bw-ssh-agent listening", "socket", cfg.SocketPath, "pid", os.Getpid())
 
 	var wg sync.WaitGroup
 	var connSeq atomic.Uint64
