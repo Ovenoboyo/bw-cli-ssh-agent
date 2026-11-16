@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"sync"
@@ -34,6 +35,46 @@ type cachedKey struct {
 	Name    string
 	PubKey  ssh.PublicKey
 	AgentID *sshagent.Key
+}
+
+// PeerInfo identifies the local client process connected to the Unix domain socket.
+type PeerInfo struct {
+	PID  int32
+	UID  uint32
+	GID  uint32
+	Comm string
+}
+
+type connAgent struct {
+	*BitwardenAgent
+	peer      PeerInfo
+	forwarded atomic.Bool
+}
+
+// ServeConn serves the OpenSSH agent protocol for a single authenticated local peer.
+func (b *BitwardenAgent) ServeConn(c net.Conn, peer PeerInfo) error {
+	ca := &connAgent{BitwardenAgent: b, peer: peer}
+	return sshagent.ServeAgent(ca, c)
+}
+
+func (c *connAgent) Extension(extensionType string, contents []byte) ([]byte, error) {
+	if extensionType == "session-bind@openssh.com" {
+		c.forwarded.Store(true)
+		c.logger.Warn("agent forwarding detected on connection; signing will be blocked",
+			"peer_pid", c.peer.PID, "peer_comm", c.peer.Comm)
+		return nil, fmt.Errorf("agent forwarding is disabled for security")
+	}
+	return c.BitwardenAgent.Extension(extensionType, contents)
+}
+
+func (c *connAgent) SignWithFlags(key ssh.PublicKey, data []byte, flags sshagent.SignatureFlags) (*ssh.Signature, error) {
+	if c.forwarded.Load() {
+		c.logger.Warn("blocked sign request from forwarded SSH agent session",
+			"peer_pid", c.peer.PID, "peer_comm", c.peer.Comm)
+		return nil, fmt.Errorf("signing via forwarded SSH agent is disallowed")
+	}
+	c.logger.Info("sign request peer context", "peer_pid", c.peer.PID, "peer_comm", c.peer.Comm)
+	return c.BitwardenAgent.SignWithFlags(key, data, flags)
 }
 
 // BitwardenAgent implements sshagent.ExtendedAgent backed by Bitwarden CLI.

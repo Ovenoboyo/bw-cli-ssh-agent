@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"fmt"
 	"os/exec"
+	"runtime"
 	"strings"
 )
 
 const (
 	DefaultKeyringDesc   = "bw_ssh_session"
-	ClientIDKeyringDesc  = "bw_client_id"
-	ClientSecKeyringDesc = "bw_client_secret"
+	sessionKeyTTLSeconds = 3600 // Auto-expire cached session token after 1 hour
 )
 
 // HasKeyctl reports whether the keyctl binary is available on PATH.
@@ -34,6 +34,7 @@ func zeroBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+	runtime.KeepAlive(b)
 }
 
 // readKeyringRaw reads a user key from the Linux user kernel keyring (@u).
@@ -51,15 +52,30 @@ func readKeyringRaw(desc string) ([]byte, error) {
 	return bytes.TrimSpace(secret), nil
 }
 
-// writeKeyringRaw writes a secret into the Linux user kernel keyring (@u), replacing any existing key.
-func writeKeyringRaw(desc string, secret []byte) error {
+// writeKeyringRaw writes a secret into @u, restricts permissions to possessor-only (0x3f000000),
+// and applies ttlSeconds expiration when ttlSeconds > 0.
+func writeKeyringRaw(desc string, secret []byte, ttlSeconds int) error {
 	cmd := exec.Command("keyctl", "padd", "user", desc, "@u")
 	cmd.Stdin = bytes.NewReader(secret)
-	return cmd.Run()
+	out, err := cmd.Output()
+	if err != nil {
+		return err
+	}
+	keyID := strings.TrimSpace(string(out))
+
+	if err := exec.Command("keyctl", "setperm", keyID, "0x3f000000").Run(); err != nil {
+		return fmt.Errorf("failed to restrict permissions on key %s: %w", keyID, err)
+	}
+
+	if ttlSeconds > 0 {
+		if err := exec.Command("keyctl", "timeout", keyID, fmt.Sprintf("%d", ttlSeconds)).Run(); err != nil {
+			return fmt.Errorf("failed to set TTL on key %s: %w", keyID, err)
+		}
+	}
+	return nil
 }
 
-// unlinkKeyringRaw removes a user key from the Linux user kernel keyring (@u) if present.
-// It returns true if the key was found and unlinked, or false if it did not exist.
+// unlinkKeyringRaw removes a user key from @u if present.
 func unlinkKeyringRaw(desc string) (bool, error) {
 	idOut, err := exec.Command("keyctl", "search", "@u", "user", desc).Output()
 	if err != nil {

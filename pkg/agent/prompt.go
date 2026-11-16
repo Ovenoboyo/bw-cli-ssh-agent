@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"fmt"
+	"html"
 	"os"
 	"os/exec"
 	"strings"
@@ -63,9 +64,12 @@ func readFromTTY(prompt string, hide bool) ([]byte, error) {
 // promptSecret asks the user for a secret via an available desktop/system askpass dialog,
 // falling back to prompting directly on /dev/tty if no GUI/system helper is installed.
 func promptSecret(title, text string, hide bool) ([]byte, error) {
+	safeTitle := html.EscapeString(title)
+	safeText := html.EscapeString(text)
+
 	// 1. Try zenity (GTK / GNOME / Hyprland)
 	if path, err := exec.LookPath("zenity"); err == nil {
-		args := []string{"--entry", "--title=" + title, "--text=" + text}
+		args := []string{"--entry", "--title=" + safeTitle, "--text=" + safeText}
 		if hide {
 			args = append(args, "--hide-text")
 		}
@@ -82,7 +86,7 @@ func promptSecret(title, text string, hide bool) ([]byte, error) {
 		if hide {
 			flag = "--password"
 		}
-		out, err := exec.Command(path, "--title", title, flag, text).Output()
+		out, err := exec.Command(path, "--title", safeTitle, flag, safeText).Output()
 		if err != nil {
 			return nil, fmt.Errorf("prompt canceled or failed: %w", err)
 		}
@@ -91,7 +95,8 @@ func promptSecret(title, text string, hide bool) ([]byte, error) {
 
 	// 3. Try yad
 	if path, err := exec.LookPath("yad"); err == nil {
-		args := []string{"--entry", "--title=" + title, "--text=" + text}
+
+		args := []string{"--entry", "--title=" + safeTitle, "--text=" + safeText}
 		if hide {
 			args = append(args, "--hide-text")
 		}
@@ -104,7 +109,7 @@ func promptSecret(title, text string, hide bool) ([]byte, error) {
 
 	// 4. Try systemd-ask-password
 	if path, err := exec.LookPath("systemd-ask-password"); err == nil {
-		out, err := exec.Command(path, "--no-tty", fmt.Sprintf("%s: %s", title, text)).Output()
+		out, err := exec.Command(path, "--no-tty", fmt.Sprintf("%s: %s", safeTitle, safeText)).Output()
 		if err != nil {
 			return nil, fmt.Errorf("systemd-ask-password failed: %w", err)
 		}
@@ -112,7 +117,7 @@ func promptSecret(title, text string, hide bool) ([]byte, error) {
 	}
 
 	// 5. Final fallback: prompt directly on the controlling terminal (/dev/tty)
-	promptLine := fmt.Sprintf("\n[%s] %s ", title, text)
+	promptLine := fmt.Sprintf("\n[%s] %s ", safeTitle, safeText)
 	if b, err := readFromTTY(promptLine, hide); err == nil {
 		return b, nil
 	}

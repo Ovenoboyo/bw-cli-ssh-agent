@@ -58,7 +58,7 @@ func (s *sessionStore) Set(session []byte) {
 	defer s.mu.Unlock()
 
 	if s.useKeyring {
-		if err := writeKeyringRaw(s.desc, session); err == nil {
+		if err := writeKeyringRaw(s.desc, session, sessionKeyTTLSeconds); err == nil {
 			zeroBytes(s.memSecret)
 			s.memSecret = nil
 			return

@@ -80,17 +80,6 @@ func Run(w io.Writer, opts Options) error {
 		} else {
 			warn("Stored BW_SESSION", fmt.Sprintf("not found in @u (%s) — will prompt on first use", opts.KeyringDesc))
 		}
-
-		hasClientID := agent.HasKeyringEntry(agent.ClientIDKeyringDesc)
-		hasClientSec := agent.HasKeyringEntry(agent.ClientSecKeyringDesc)
-		switch {
-		case hasClientID && hasClientSec:
-			pass("Stored API key", "client_id and client_secret present in @u")
-		case hasClientID || hasClientSec:
-			warn("Stored API key", "partial API key in @u (missing client_id or client_secret)")
-		default:
-			warn("Stored API key", "not stored in @u (will use env vars or interactive email/password login)")
-		}
 	}
 
 	if os.Getenv("BW_CLIENTID") != "" && os.Getenv("BW_CLIENTSECRET") != "" {

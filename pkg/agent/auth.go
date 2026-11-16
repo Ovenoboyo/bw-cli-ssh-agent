@@ -9,17 +9,9 @@ import (
 	"strings"
 )
 
-// StoreAPIKey checks that keyctl and the user kernel keyring (@u) are available,
-// then prompts for the Bitwarden Personal API Key without echoing secrets and stores them.
-func StoreAPIKey() error {
-	if !HasKeyctl() {
-		return fmt.Errorf("keyctl is not installed; refusing to store API key without kernel keyring")
-	}
-	// Verify the user kernel keyring (@u) is active and writable in this session
-	if err := exec.Command("keyctl", "show", "@u").Run(); err != nil {
-		return fmt.Errorf("user kernel keyring (@u) is unavailable; refusing to store API key: %w", err)
-	}
-
+// LoginWithAPIKey prompts for the Bitwarden Personal API Key (client_id and client_secret)
+// without echoing secrets, passes them once to `bw login --apikey`, and zeroes them in memory.
+func LoginWithAPIKey() error {
 	clientID, err := readSecretInput("Bitwarden API Key", "Enter Bitwarden Client ID (e.g. user.xxxx): ", false)
 	if err != nil {
 		return err
@@ -40,34 +32,15 @@ func StoreAPIKey() error {
 		return fmt.Errorf("client secret cannot be empty")
 	}
 
-	if err := writeKeyringRaw(ClientIDKeyringDesc, clientID); err != nil {
-		return fmt.Errorf("failed to store %s in kernel keyring: %w", ClientIDKeyringDesc, err)
+	cmd := exec.Command("bw", "login", "--apikey")
+	cmd.Env = append(os.Environ(),
+		"BW_CLIENTID="+string(clientID),
+		"BW_CLIENTSECRET="+string(clientSecret),
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("bw login --apikey failed: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
-	if err := writeKeyringRaw(ClientSecKeyringDesc, clientSecret); err != nil {
-		return fmt.Errorf("failed to store %s in kernel keyring: %w", ClientSecKeyringDesc, err)
-	}
-
 	return nil
-}
-
-// ClearAPIKey removes the stored Bitwarden API key credentials (bw_client_id and bw_client_secret)
-// from the Linux user kernel keyring (@u).
-func ClearAPIKey() (int, error) {
-	if !HasKeyctl() {
-		return 0, fmt.Errorf("keyctl is not installed; cannot clear API key from kernel keyring")
-	}
-
-	removed := 0
-	for _, desc := range []string{ClientIDKeyringDesc, ClientSecKeyringDesc} {
-		ok, err := unlinkKeyringRaw(desc)
-		if err != nil {
-			return removed, err
-		}
-		if ok {
-			removed++
-		}
-	}
-	return removed, nil
 }
 
 func checkBWStatus() (string, error) {
@@ -85,19 +58,14 @@ func checkBWStatus() (string, error) {
 }
 
 func loginInteractive(s *sessionStore) error {
+	// If BW_CLIENTID / BW_CLIENTSECRET were explicitly supplied in the environment, use them
 	clientID := []byte(os.Getenv("BW_CLIENTID"))
 	clientSecret := []byte(os.Getenv("BW_CLIENTSECRET"))
-	if len(clientID) == 0 && s.useKeyring {
-		clientID, _ = readKeyringRaw(ClientIDKeyringDesc)
-	}
-	if len(clientSecret) == 0 && s.useKeyring {
-		clientSecret, _ = readKeyringRaw(ClientSecKeyringDesc)
-	}
 	defer zeroBytes(clientID)
 	defer zeroBytes(clientSecret)
 
 	if len(clientID) > 0 && len(clientSecret) > 0 {
-		s.logger.Info("logging into Bitwarden via API key")
+		s.logger.Info("logging into Bitwarden via environment API key")
 		cmd := exec.Command("bw", "login", "--apikey")
 		cmd.Env = append(os.Environ(),
 			"BW_CLIENTID="+string(clientID),
@@ -122,11 +90,11 @@ func loginInteractive(s *sessionStore) error {
 	}
 	defer zeroBytes(pw)
 
-	cmd := exec.Command("bw", "login", string(email), "--raw")
+	cmd := exec.Command("bw", "login", "--", string(email), "--raw")
 	cmd.Stdin = bytes.NewReader(append(pw, '\n'))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("bw login failed (if 2FA is enabled, log in once in terminal or use API key): %w (%s)", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("bw login failed (if 2FA is enabled, run 'bw-ssh-agent --login-apikey' once): %w (%s)", err, strings.TrimSpace(string(out)))
 	}
 
 	session := bytes.TrimSpace(out)
